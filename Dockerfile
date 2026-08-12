@@ -3,7 +3,7 @@
 # Sólo datos sintéticos; nunca contiene secretos ni datos personales.
 
 # --- dependencias -----------------------------------------------------------
-FROM node:22-alpine AS deps
+FROM node:26-alpine AS deps
 RUN mkdir -p /app && chown node:node /app
 WORKDIR /app
 USER node
