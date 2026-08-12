@@ -1,0 +1,218 @@
+# Integración continua rápida de Fides.
+#
+# Sólo datos sintéticos: la base de datos es un contenedor efímero del runner y
+# ningún paso habla con un proveedor externo (correo, WhatsApp o revisión
+# asistida). No requiere ningún secreto del repositorio.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Una ejecución viva por referencia: los empujes nuevos cancelan los anteriores.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NEXT_TELEMETRY_DISABLED: "1"
+
+jobs:
+  calidad:
+    name: Calidad (lint y tipos)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Instalar dependencias
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          # `package-lock.json` se genera en macOS y sólo conserva los binarios
+          # nativos de Darwin (lo documenta el Dockerfile). En ubuntu-latest
+          # faltan las variantes linux-x64 de lightningcss, @tailwindcss/oxide y
+          # oxlint; `npm rebuild` no las recupera porque ni siquiera están en el
+          # lockfile. Se añaden aquí en una sola instalación (varias llamadas
+          # sucesivas con `--no-save` se podarían entre sí) tomando la versión
+          # exacta que declara cada paquete padre ya instalado.
+          binarios="$(node -e '
+            const pares = [
+              ["lightningcss", "lightningcss-linux-x64-gnu"],
+              ["@tailwindcss/oxide", "@tailwindcss/oxide-linux-x64-gnu"],
+              ["oxlint", "@oxlint/binding-linux-x64-gnu"],
+            ];
+            const specs = pares.map(([padre, binario]) => {
+              const meta = require(`./node_modules/${padre}/package.json`);
+              const rango = (meta.optionalDependencies ?? {})[binario] ?? meta.version;
+              return `${binario}@${rango}`;
+            });
+            console.log(specs.join(" "));
+          ')"
+          npm install --no-save --no-audit --no-fund $binarios
+
+      - name: Lint (eslint y oxlint)
+        run: npm run lint
+
+      - name: Tipos (tsc --noEmit)
+        run: npm run typecheck
+
+  pruebas:
+    name: Pruebas y cobertura
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Base de datos desechable del runner. Las credenciales son las mismas
+    # cadenas sintéticas del entorno local: no son un secreto y no viven fuera
+    # de esta ejecución.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: fides
+          POSTGRES_USER: fides
+          POSTGRES_PASSWORD: fides_local_only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fides -d fides"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # `tests/global-setup.ts` se conecta a la base administrativa `postgres`,
+      # recrea `fides_test` y aplica `db/migrations/`. Desde el runner el
+      # servicio se publica en localhost:5432.
+      TEST_ADMIN_DATABASE_URL: postgres://fides:fides_local_only@127.0.0.1:5432/postgres
+      # `vitest.config.ts` toma esta variable como `DATABASE_URL` de las pruebas;
+      # debe apuntar a la base que crea el global setup.
+      TEST_DATABASE_URL: postgres://fides:fides_local_only@127.0.0.1:5432/fides_test
+      TEST_DATABASE_NAME: fides_test
+
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Instalar dependencias
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          # Mismo ajuste de binarios nativos que en `calidad`.
+          binarios="$(node -e '
+            const pares = [
+              ["lightningcss", "lightningcss-linux-x64-gnu"],
+              ["@tailwindcss/oxide", "@tailwindcss/oxide-linux-x64-gnu"],
+              ["oxlint", "@oxlint/binding-linux-x64-gnu"],
+            ];
+            const specs = pares.map(([padre, binario]) => {
+              const meta = require(`./node_modules/${padre}/package.json`);
+              const rango = (meta.optionalDependencies ?? {})[binario] ?? meta.version;
+              return `${binario}@${rango}`;
+            });
+            console.log(specs.join(" "));
+          ')"
+          npm install --no-save --no-audit --no-fund $binarios
+
+      # Los umbrales de cobertura viven en `vitest.config.ts`; aquí no se
+      # repiten. Si bajan, el comando falla solo.
+      - name: Pruebas con cobertura
+        run: npm run test:coverage
+
+      - name: Publicar el resumen de cobertura
+        if: always()
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const salida = process.env.GITHUB_STEP_SUMMARY;
+            const ruta = "coverage/coverage-summary.json";
+            if (!fs.existsSync(ruta)) {
+              fs.appendFileSync(salida, "## Cobertura\n\nNo se generó `coverage/coverage-summary.json`.\n");
+              process.exit(0);
+            }
+            const total = JSON.parse(fs.readFileSync(ruta, "utf8")).total;
+            const filas = ["## Cobertura", "", "| Métrica | Cubierto | Total | % |", "|---|---:|---:|---:|"];
+            for (const clave of ["lines", "statements", "functions", "branches"]) {
+              const dato = total[clave];
+              filas.push(`| ${clave} | ${dato.covered} | ${dato.total} | ${dato.pct}% |`);
+            }
+            filas.push("", "Umbrales definidos en `vitest.config.ts`.", "");
+            fs.appendFileSync(salida, filas.join("\n"));
+          '
+
+      - name: Guardar el reporte de cobertura
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cobertura-${{ github.run_id }}-${{ github.run_attempt }}
+          path: coverage/
+          retention-days: 7
+          if-no-files-found: warn
+
+  construccion:
+    name: Construcción
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      # Antes de instalar, para que `hashFiles` no recorra `node_modules`.
+      - name: Caché de `.next/cache`
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('app/**', 'components/**', 'lib/**', 'design-system/**', '*.mjs', '*.ts') }}
+          restore-keys: |
+            next-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-
+            next-${{ runner.os }}-
+
+      - name: Preparar Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Instalar dependencias
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          # `next build` compila Tailwind v4: sin los binarios linux-x64 de
+          # lightningcss y @tailwindcss/oxide la construcción falla.
+          binarios="$(node -e '
+            const pares = [
+              ["lightningcss", "lightningcss-linux-x64-gnu"],
+              ["@tailwindcss/oxide", "@tailwindcss/oxide-linux-x64-gnu"],
+              ["oxlint", "@oxlint/binding-linux-x64-gnu"],
+            ];
+            const specs = pares.map(([padre, binario]) => {
+              const meta = require(`./node_modules/${padre}/package.json`);
+              const rango = (meta.optionalDependencies ?? {})[binario] ?? meta.version;
+              return `${binario}@${rango}`;
+            });
+            console.log(specs.join(" "));
+          ')"
+          npm install --no-save --no-audit --no-fund $binarios
+
+      # No necesita base de datos: la misma construcción corre en el Dockerfile
+      # sin PostgreSQL disponible.
+      - name: Construir
+        run: npm run build

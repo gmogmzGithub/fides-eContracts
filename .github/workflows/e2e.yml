@@ -1,0 +1,110 @@
+# Prueba de extremo a extremo de Fides sobre la pila real de Docker Compose
+# (PostgreSQL, aplicación, worker, cola y DLQ, captura de mensajes y doble local
+# de revisión asistida).
+#
+# Todo es sintético y local al runner: `sink` retiene el correo y el WhatsApp,
+# `ai-double` sustituye al proveedor de revisión asistida y nada sale hacia un
+# proveedor externo. No requiere ningún secreto del repositorio: la contraseña
+# de las cuentas sintéticas se genera al vuelo y muere con la ejecución.
+
+name: E2E local
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pila-local:
+    name: Pila local y prueba de humo
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # `scripts/smoke.mjs` sólo importa `postgres` y módulos de Node, así que
+      # aquí no hacen falta los binarios nativos que sí ajusta `ci.yml`.
+      - name: Instalar dependencias de la prueba de humo
+        run: npm ci --no-audit --no-fund
+
+      # La contraseña sintética se escribe directamente en `.env` (ignorado por
+      # Git) sin pasar por el registro ni por una variable exportada. Nunca es
+      # literal, nunca se imprime y nunca se reutiliza entre ejecuciones.
+      - name: Escribir un `.env` desechable
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            printf 'FIDES_SEED_PASSWORD=%s\n' "$(openssl rand -hex 32)"
+            printf 'FIDES_PUBLIC_URL=%s\n' 'http://localhost:3002'
+            printf 'FIDES_WORKER_TOKEN=%s\n' 'fides-worker-ci'
+          } > .env
+
+      - name: Levantar la pila
+        run: docker compose up -d --build
+
+      - name: Esperar a `/api/salud`
+        run: |
+          set -euo pipefail
+          for intento in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://localhost:3002/api/salud; then
+              echo "La aplicación responde en /api/salud (intento ${intento})."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "La aplicación no respondió en /api/salud."
+          docker compose ps --all
+          exit 1
+
+      - name: Comprobar los accesos sintéticos
+        run: npm run verify:logins
+
+      - name: Prueba de humo
+        run: |
+          npm run smoke
+          npm run smoke:queue
+
+      # Los registros son sintéticos, pero incluyen las altas de segundo factor
+      # que imprime la semilla: se conservan poco tiempo y sólo ante una falla.
+      - name: Recoger los registros de Docker Compose
+        if: failure()
+        run: |
+          set -uo pipefail
+          mkdir -p registros-compose
+          for servicio in $(docker compose config --services); do
+            docker compose logs --no-color --timestamps "$servicio" \
+              > "registros-compose/${servicio}.log" 2>&1 || true
+          done
+          docker compose ps --all > registros-compose/estado.txt 2>&1 || true
+
+      - name: Guardar los registros
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: registros-compose-${{ github.run_id }}-${{ github.run_attempt }}
+          path: registros-compose/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Desmontar la pila
+        if: always()
+        run: |
+          docker compose down -v --remove-orphans || true
+          rm -f .env

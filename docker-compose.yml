@@ -1,0 +1,193 @@
+# Versión local dockerizada de Fides (ADR-0082).
+# Sólo datos sintéticos. Ningún mensaje sale de esta máquina: correo y WhatsApp
+# se capturan en `sink` y la revisión asistida usa el doble local `ai-double`.
+#
+# Funciona sin `.env`: las 19 cuentas sintéticas comparten la contraseña
+# pública del demo. Un `.env` local puede sobreescribir cualquier valor.
+
+name: fides
+
+x-image: &image
+  image: fides-local:latest
+  pull_policy: never
+
+x-environment: &environment
+  NODE_ENV: production
+  DATABASE_URL: postgres://fides:fides_local_only@postgres:5432/fides
+  # Dirección interna entre contenedores; `app` y `seed` la sobreescriben con
+  # la dirección pública para que los enlaces copiados abran desde el navegador.
+  FIDES_APP_URL: http://app:3002
+  FIDES_PUBLIC_URL: ${FIDES_PUBLIC_URL:-http://localhost:3002}
+  FIDES_OBJECT_DIR: /var/lib/fides/objects
+  FIDES_SINK_URL: http://sink:8025/api/messages
+  FIDES_AI_URL: http://ai-double:8030/analizar
+  FIDES_WORKER_TOKEN: ${FIDES_WORKER_TOKEN:-fides-worker-local}
+  # HTTP local: la cookie de sesión no puede exigir `Secure`.
+  FIDES_INSECURE_COOKIES: "true"
+  # Entorno sintético: habilita la grabación de prueba para recorrer el video
+  # en un equipo sin cámara. Nunca debe activarse fuera de este entorno.
+  FIDES_ALLOW_SYNTHETIC_EVIDENCE: "true"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: fides
+      POSTGRES_USER: fides
+      POSTGRES_PASSWORD: fides_local_only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fides -d fides"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "127.0.0.1:54329:5432"
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  migrate:
+    <<: *image
+    command: ["node", "scripts/migrate.mjs"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *environment
+    restart: "no"
+
+  seed:
+    <<: *image
+    command: ["node", "scripts/seed.mjs"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *environment
+      FIDES_APP_URL: ${FIDES_PUBLIC_URL:-http://localhost:3002}
+      # Contraseña pública del demo sintético. El valor predeterminado permite
+      # levantar la pila sin `.env`; `.env` puede sobreescribirlo.
+      FIDES_SEED_PASSWORD: ${FIDES_SEED_PASSWORD:-FidesDemo123!}
+    restart: "no"
+    volumes:
+      - objects:/var/lib/fides/objects
+
+  app:
+    <<: *image
+    build:
+      context: .
+      target: runtime
+    command: ["node", ".next/standalone/server.js"]
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    environment:
+      <<: *environment
+      FIDES_APP_URL: ${FIDES_PUBLIC_URL:-http://localhost:3002}
+      HOSTNAME: 0.0.0.0
+      PORT: "3002"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3002/api/salud').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    ports:
+      - "127.0.0.1:3002:3002"
+    restart: unless-stopped
+    volumes:
+      - objects:/var/lib/fides/objects
+
+  queue:
+    image: softwaremill/elasticmq-native:1.7.1
+    command: ["-Dconfig.file=/opt/elasticmq.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 9324"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "127.0.0.1:9324:9324"
+    restart: unless-stopped
+    volumes:
+      - ./config/elasticmq.conf:/opt/elasticmq.conf:ro
+      - queue_data:/data
+
+  worker:
+    <<: *image
+    command: ["node", "scripts/worker.mjs"]
+    depends_on:
+      app:
+        condition: service_healthy
+      ai-double:
+        condition: service_healthy
+      sink:
+        condition: service_healthy
+      queue:
+        condition: service_healthy
+    environment:
+      <<: *environment
+      FIDES_QUEUE_MODE: sqs
+      FIDES_QUEUE_ENDPOINT: http://queue:9324
+      FIDES_JOB_QUEUE: fides-background-jobs
+      FIDES_JOB_DLQ: fides-background-jobs-dlq
+      AWS_REGION: elasticmq
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      FIDES_MAX_JOB_ATTEMPTS: "3"
+      FIDES_WORKER_RETRY_BASE_SECONDS: "1"
+    restart: unless-stopped
+    stop_grace_period: 20s
+    volumes:
+      - objects:/var/lib/fides/objects
+
+  sink:
+    <<: *image
+    command: ["node", "scripts/message-sink.mjs"]
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8025"
+      FIDES_SINK_STATE_FILE: /var/lib/fides/sink/mensajes.json
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8025/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:8025:8025"
+    restart: unless-stopped
+    volumes:
+      - sink_data:/var/lib/fides/sink
+
+  ai-double:
+    <<: *image
+    command: ["node", "scripts/ai-double.mjs"]
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8030"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8030/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:8030:8030"
+    restart: unless-stopped
+
+volumes:
+  objects:
+  postgres_data:
+  queue_data:
+  sink_data:

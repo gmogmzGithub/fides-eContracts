@@ -1,0 +1,17 @@
+# Contexto mínimo para la imagen local.
+.git
+.github
+.claude
+.build
+.vercel
+node_modules
+.next
+out
+coverage
+*.tsbuildinfo
+.DS_Store
+
+# Nunca copiar configuración local con la contraseña sintética.
+.env
+.env.*
+!.env.example
