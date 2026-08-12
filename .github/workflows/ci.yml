@@ -28,10 +28,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Descargar el repositorio
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Preparar Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -103,10 +103,10 @@ jobs:
 
     steps:
       - name: Descargar el repositorio
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Preparar Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -160,7 +160,7 @@ jobs:
 
       - name: Guardar el reporte de cobertura
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cobertura-${{ github.run_id }}-${{ github.run_attempt }}
           path: coverage/
@@ -173,11 +173,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Descargar el repositorio
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Antes de instalar, para que `hashFiles` no recorra `node_modules`.
       - name: Caché de `.next/cache`
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .next/cache
           key: next-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('app/**', 'components/**', 'lib/**', 'design-system/**', '*.mjs', '*.ts') }}
@@ -186,7 +186,7 @@ jobs:
             next-${{ runner.os }}-
 
       - name: Preparar Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
